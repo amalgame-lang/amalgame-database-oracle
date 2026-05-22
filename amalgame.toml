@@ -1,0 +1,106 @@
+# Package manifest — amalgame-database-oracle
+#
+# Oracle Database binding for Amalgame — dynamic-linked to the
+# Oracle Call Interface (OCI) C library shipped with the
+# vendor-distributed *Oracle Instant Client*. Nothing is vendored:
+# this follows the same dynamic-link manifest pattern as
+# `amalgame-database-postgresql`, `amalgame-database-mysql`, and
+# `amalgame-database-mssql`.
+#
+# Why dynamic-link via Instant Client:
+#   - OCI is the only client API that Oracle distributes; there
+#     is no open-source FOSS substitute that speaks Oracle's
+#     proprietary wire protocol.
+#   - Oracle's licence forbids redistribution: the Instant Client
+#     must be downloaded by the end user from oracle.com, free of
+#     charge but under their OTN licence (development + production
+#     use permitted, redistribution restricted).
+#   - The shared lib is large (~100 MB) and tracks the database
+#     server's protocol versions; vendoring it would also be a
+#     licence violation.
+#
+# Prereqs (compile time): the *Oracle Instant Client Basic + SDK*
+# packages. Download from
+# https://www.oracle.com/database/technologies/instant-client/downloads.html
+# and follow the install instructions for your OS — they unpack
+# to `instantclient_<major>_<minor>/` containing `libclntsh.so*`
+# (runtime) and `sdk/include/oci.h` (compile-time headers).
+#
+# Point amc at the unpacked SDK via env vars:
+#
+#   export AMALGAME_EXTRA_CFLAGS="-I/opt/instantclient_21_13/sdk/include"
+#   export AMALGAME_EXTRA_LDFLAGS="-L/opt/instantclient_21_13 -Wl,-rpath,/opt/instantclient_21_13"
+#
+# Prereqs (runtime, the deployed user binary): the matching
+# `libclntsh.so` / `libclntsh.dylib` / `oci.dll` must be present
+# on the user's machine. Either install the Instant Client into a
+# system path (`LD_LIBRARY_PATH` / `DYLD_LIBRARY_PATH`) or ship
+# it alongside the binary with an explicit rpath.
+#
+# Surface (v1):
+#   Open(user, password, connStr) / Close /
+#     IsOpen / LastError                          lifecycle + diag
+#   Exec(sql)                                      DDL / INSERT / UPDATE / DELETE
+#   QueryAll(sql) → List<List<string>>             SELECT all rows × cols
+#   Changes                                        rows affected by last Exec
+#   ServerVersion                                  Oracle server release string
+#
+# `connStr` for Open() is the Oracle "Easy Connect" form (no
+# tnsnames.ora needed):
+#
+#   "//host:port/service"      — e.g. "//127.0.0.1:1521/XEPDB1"
+#   "//host:port/service:dedicated"
+#   "//host/service"           — default port 1521
+#   "myalias"                  — TNS alias from $ORACLE_HOME/network/admin/tnsnames.ora
+#
+# Out of scope (v2):
+#   - Bind variables (`:1`, `:name`) via OCIBindByPos / OCIBindByName
+#   - OCIStmtPrepare2 + statement caching
+#   - Typed column accessors (AsInt / AsBytes / AsTimestamp)
+#   - Session pooling (`OCISessionPool*`) — Oracle connections
+#     are expensive enough that pooling is a real ask
+#   - PL/SQL OUT / INOUT bind variables
+#   - LOB streaming (OCILobRead / OCILobWrite)
+#   - Continuous query notification / change notification
+#
+# Installation:
+#
+#   amc package add oracle                                           # via index
+#   amc package add github.com/amalgame-lang/amalgame-database-oracle@v0.1.0
+
+[package]
+name              = "amalgame-database-oracle"
+version           = "0.1.0"
+license           = "Apache-2.0"
+description       = "Oracle Database binding for Amalgame — dynamic-linked to Oracle Instant Client (OCI), no vendored lib."
+authors           = ["Bastien Mouget"]
+required-amalgame = ">=0.8.19"
+schema-version    = 1
+
+[stdlib]
+class     = "Oracle"
+header    = "runtime/Amalgame_Database_Oracle.h"
+namespace = "Amalgame.Database.Oracle"
+
+# No vendored .c sources — the Oracle Instant Client is provided
+# by the user. The wrapper header includes <oci.h> which the
+# user's CFLAGS (`AMALGAME_EXTRA_CFLAGS=-I…/instantclient/sdk/include`)
+# must put on the include path.
+
+# Link against `libclntsh` — the Instant Client's shared lib that
+# exposes OCI. amc forwards as `-lclntsh` to the user binary's
+# gcc step. The user's `AMALGAME_EXTRA_LDFLAGS=-L…/instantclient
+# -Wl,-rpath,…/instantclient` must point at the install location.
+libs       = ["clntsh"]
+
+[stdlib.functions]
+Open           = { returns = "AmalgameOracle*" }
+Close          = { returns = "void" }
+IsOpen         = { returns = "code_bool" }
+LastError      = { returns = "code_string" }
+Exec           = { returns = "code_bool" }
+QueryAll       = { returns = "AmalgameList*" }
+Changes        = { returns = "i64" }
+ServerVersion  = { returns = "code_string" }
+
+[dependencies]

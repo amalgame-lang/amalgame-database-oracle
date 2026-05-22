@@ -1,0 +1,140 @@
+// Stdlib test: Amalgame.Database.Oracle — OCI binding via Instant Client.
+// Self-contained schema namespace (`amctest_*` prefix) so a
+// shared dev server isn't polluted. Tests CREATE / INSERT /
+// SELECT / DROP.
+//
+// Connection params come from the environment so the .am file
+// itself doesn't carry credentials:
+//
+//   ORACLE_USER         (e.g. "system")
+//   ORACLE_PASSWORD     (e.g. "oracle")
+//   ORACLE_CONNSTR      (e.g. "//127.0.0.1:1521/XEPDB1")
+//
+// The test runner exports these before invoking us.
+
+namespace Tests
+
+import Amalgame.Database.Oracle
+
+public class Program {
+    public static void Main(string[] args) {
+
+        let user: string     = Env.Get("ORACLE_USER")
+        let password: string = Env.Get("ORACLE_PASSWORD")
+        let connStr: string  = Env.Get("ORACLE_CONNSTR")
+        if (String_Length(user) == 0 || String_Length(connStr) == 0) {
+            Console.WriteLine("[FAIL] ORACLE_USER / ORACLE_CONNSTR not set")
+            return
+        }
+
+        let db = Oracle.Open(user, password, connStr)
+        if (Oracle.IsOpen(db)) {
+            Console.WriteLine("[PASS] open")
+        } else {
+            Console.WriteLine("[FAIL] open: " + Oracle.LastError(db))
+            return
+        }
+
+        // ── ServerVersion ────────────────────────────────────
+        let ver: string = Oracle.ServerVersion(db)
+        if (String_Length(ver) > 0) {
+            Console.WriteLine("[PASS] ServerVersion: " + ver)
+        } else {
+            Console.WriteLine("[FAIL] ServerVersion empty")
+        }
+
+        // ── DDL: clean slate + table ──────────────────────────
+        // Oracle has no "DROP TABLE IF EXISTS" pre-23ai. The
+        // exec call swallows the ORA-00942 (table doesn't exist)
+        // silently — LastError is the only side effect, which
+        // we ignore.
+        Oracle.Exec(db, "DROP TABLE amctest_notes")
+        let createOk: bool = Oracle.Exec(db,
+            "CREATE TABLE amctest_notes ("
+            + "id NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY, "
+            + "body VARCHAR2(200))")
+        if (createOk) {
+            Console.WriteLine("[PASS] CREATE TABLE")
+        } else {
+            Console.WriteLine("[FAIL] CREATE: " + Oracle.LastError(db))
+        }
+
+        // ── INSERT (3 rows) ───────────────────────────────────
+        Oracle.Exec(db, "INSERT INTO amctest_notes (body) VALUES ('alpha')")
+        Oracle.Exec(db, "INSERT INTO amctest_notes (body) VALUES ('beta')")
+        Oracle.Exec(db, "INSERT INTO amctest_notes (body) VALUES ('gamma')")
+        let lastChg: int = Oracle.Changes(db)
+        if (lastChg == 1) {
+            Console.WriteLine("[PASS] INSERT Changes==1")
+        } else {
+            Console.WriteLine("[FAIL] INSERT Changes=" + String_FromInt(lastChg))
+        }
+
+        // ── SELECT — 3 rows × 2 cols ─────────────────────────
+        let rows = Oracle.QueryAll(db,
+            "SELECT id, body FROM amctest_notes ORDER BY id")
+        if (rows.Count() == 3) {
+            Console.WriteLine("[PASS] SELECT 3 rows")
+        } else {
+            Console.WriteLine("[FAIL] SELECT got " + String_FromInt(rows.Count())
+                + " rows")
+        }
+
+        // ── Verify cell content ──────────────────────────────
+        let row0 = rows.Get(0)
+        let row1 = rows.Get(1)
+        let row2 = rows.Get(2)
+        let body0: string = row0.Get(1)
+        let body1: string = row1.Get(1)
+        let body2: string = row2.Get(1)
+        let okBodies: bool = body0 == "alpha"
+        let okBodies2: bool = body1 == "beta"
+        let okBodies3: bool = body2 == "gamma"
+        if (okBodies && okBodies2 && okBodies3) {
+            Console.WriteLine("[PASS] SELECT cell content")
+        } else {
+            Console.WriteLine("[FAIL] cells: '" + body0 + "' / '"
+                + body1 + "' / '" + body2 + "'")
+        }
+
+        // ── Verify IDENTITY id starts at 1 ───────────────────
+        let id0: string = row0.Get(0)
+        if (id0 == "1") {
+            Console.WriteLine("[PASS] IDENTITY id starts at 1")
+        } else {
+            Console.WriteLine("[FAIL] id0 = '" + id0 + "'")
+        }
+
+        // ── UPDATE — Changes returns affected count ──────────
+        Oracle.Exec(db,
+            "UPDATE amctest_notes SET body = 'updated' WHERE body = 'alpha' OR body = 'beta'")
+        let chgUpd: int = Oracle.Changes(db)
+        if (chgUpd == 2) {
+            Console.WriteLine("[PASS] UPDATE Changes==2")
+        } else {
+            Console.WriteLine("[FAIL] UPDATE Changes=" + String_FromInt(chgUpd))
+        }
+
+        // ── Bad SQL → LastError populated ────────────────────
+        let badOk: bool = Oracle.Exec(db, "INVALID SQL HERE")
+        if (badOk) {
+            Console.WriteLine("[FAIL] invalid sql returned OK")
+        } else {
+            let err: string = Oracle.LastError(db)
+            if (String_Length(err) > 0) {
+                Console.WriteLine("[PASS] bad SQL reports error")
+            } else {
+                Console.WriteLine("[FAIL] bad SQL: no error string")
+            }
+        }
+
+        // ── Cleanup + close ──────────────────────────────────
+        Oracle.Exec(db, "DROP TABLE amctest_notes")
+        Oracle.Close(db)
+        if (!Oracle.IsOpen(db)) {
+            Console.WriteLine("[PASS] Close drops connection")
+        } else {
+            Console.WriteLine("[FAIL] still open after Close")
+        }
+    }
+}

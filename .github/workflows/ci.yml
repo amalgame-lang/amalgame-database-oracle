@@ -1,0 +1,103 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Test against amc ${{ matrix.amc-tag }}
+    runs-on: ubuntu-latest
+
+    # Service container: community-maintained Oracle XE 21 (slim
+    # variant ~1 GB). The image is preconfigured with a service
+    # named XEPDB1 reachable as system / $ORACLE_PASSWORD.
+    services:
+      oracle:
+        image: gvenzl/oracle-xe:21-slim
+        env:
+          ORACLE_PASSWORD: oracle
+        ports: ['1521:1521']
+        options: >-
+          --health-cmd "healthcheck.sh"
+          --health-interval 20s
+          --health-timeout 10s
+          --health-retries 20
+
+    env:
+      ORACLE_HOST: 127.0.0.1
+      ORACLE_PORT: 1521
+      ORACLE_USER: system
+      ORACLE_PASSWORD: oracle
+      ORACLE_CONNSTR: '//127.0.0.1:1521/XEPDB1'
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # v0.8.19+ is required (cgen + LSP fixes for cross-package
+        # opaque collection indexing). Append a tag whenever amc
+        # cuts a meaningfully relevant release.
+        amc-tag: [v0.8.20]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system deps (libgc + libcurl + libaio)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y libgc-dev libcurl4-openssl-dev libaio1 unzip
+
+      - name: Download Oracle Instant Client (Basic + SDK)
+        run: |
+          set -e
+          # Pin to a Long Term Support release.
+          IC_VER="21.13.0.0.0"
+          IC_BASE="https://download.oracle.com/otn_software/linux/instantclient/2113000"
+          curl -sSL -o basic.zip "${IC_BASE}/instantclient-basic-linux.x64-${IC_VER}dbru.zip"
+          curl -sSL -o sdk.zip   "${IC_BASE}/instantclient-sdk-linux.x64-${IC_VER}dbru.zip"
+          sudo mkdir -p /opt
+          sudo unzip -q -o basic.zip -d /opt
+          sudo unzip -q -o sdk.zip   -d /opt
+          IC_DIR="$(ls -d /opt/instantclient_21_* | head -1)"
+          echo "ORACLE_HOME=$IC_DIR" >> $GITHUB_ENV
+          echo "LD_LIBRARY_PATH=$IC_DIR" >> $GITHUB_ENV
+          # libclntsh.so.21.1 ships with a versioned name; create
+          # the unversioned symlink the linker expects with -lclntsh.
+          if [ ! -e "$IC_DIR/libclntsh.so" ] && ls "$IC_DIR"/libclntsh.so.* >/dev/null 2>&1; then
+            sudo ln -sf "$(ls "$IC_DIR"/libclntsh.so.* | head -1)" "$IC_DIR/libclntsh.so"
+          fi
+          ls -la "$IC_DIR"/libclntsh* "$IC_DIR/sdk/include/oci.h"
+
+      - name: Download amc ${{ matrix.amc-tag }}
+        run: |
+          set -e
+          TAG="${{ matrix.amc-tag }}"
+          VERSION="${TAG#v}"
+          curl -sSL -o amc.tar.gz \
+            "https://github.com/amalgame-lang/Amalgame/releases/download/${TAG}/amc-${VERSION}-linux-x86_64.tar.gz"
+          mkdir -p $RUNNER_TEMP/amc-install
+          tar -xzf amc.tar.gz -C $RUNNER_TEMP/amc-install --strip-components=1
+          echo "AMC=$RUNNER_TEMP/amc-install/bin/amc" >> $GITHUB_ENV
+          echo "AMC_RUNTIME=$RUNNER_TEMP/amc-install/share/amalgame/runtime" >> $GITHUB_ENV
+
+      - name: Probe OCI + wait for Oracle XE
+        run: |
+          echo "── oci.h probe ──"
+          gcc -E -I"$ORACLE_HOME/sdk/include" -xc - <<< '#include <oci.h>' >/dev/null \
+            && echo "  oci.h: OK"
+          echo "── oracle reachability (poll up to 200s) ──"
+          for i in $(seq 1 40); do
+            if (echo > /dev/tcp/127.0.0.1/1521) 2>/dev/null; then
+              echo "  tcp 1521: reachable after ${i}×5s"; break
+            fi
+            sleep 5
+          done
+
+      - name: Run end-to-end tests
+        run: |
+          chmod +x ./tests/run_tests.sh
+          ./tests/run_tests.sh "$AMC"
