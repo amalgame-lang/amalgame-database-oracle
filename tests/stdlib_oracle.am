@@ -84,9 +84,9 @@ public class Program {
         let row0 = rows.Get(0)
         let row1 = rows.Get(1)
         let row2 = rows.Get(2)
-        let body0: string = row0.Get(1)
-        let body1: string = row1.Get(1)
-        let body2: string = row2.Get(1)
+        let body0 = row0.Get(1)
+        let body1 = row1.Get(1)
+        let body2 = row2.Get(1)
         let okBodies: bool = body0 == "alpha"
         let okBodies2: bool = body1 == "beta"
         let okBodies3: bool = body2 == "gamma"
@@ -98,7 +98,7 @@ public class Program {
         }
 
         // ── Verify IDENTITY id starts at 1 ───────────────────
-        let id0: string = row0.Get(0)
+        let id0 = row0.Get(0)
         if (id0 == "1") {
             Console.WriteLine("[PASS] IDENTITY id starts at 1")
         } else {
