@@ -38,20 +38,19 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # v0.8.19+ is required (cgen + LSP fixes for cross-package
-        # opaque collection indexing). Append a tag whenever amc
-        # cuts a meaningfully relevant release.
-        amc-tag: [v0.8.20]
+        # v0.2.0+ requires amc 0.8.40+ for `returns_generic` on
+        # QueryAll. Pinned to the latest amc release.
+        amc-tag: [v0.8.47]
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install system deps (libgc + libcurl + libaio)
+      - name: Install system deps (libgc + libaio)
         run: |
           sudo apt-get update -qq
           # Ubuntu renamed libaio1 → libaio1t64 in the 24.04 time_t
           # transition; try both, succeed on whichever is present.
-          sudo apt-get install -y libgc-dev libcurl4-openssl-dev unzip
+          sudo apt-get install -y libgc-dev unzip
           sudo apt-get install -y libaio1t64 || sudo apt-get install -y libaio1
           # libclntsh dlopen()'s libaio.so.1 without a versioned
           # SONAME; on 24.04 only libaio.so.1t64 exists, so add a

@@ -200,7 +200,7 @@ run_test() {
         -I"$AMC_RUNTIME" -I"$PKG_RUNTIME" $extra_inc \
         "$out_base.c" \
         $extra_lib \
-        -lgc -lm -lcurl -ldl -lpthread -lclntsh \
+        -lgc -lm -ldl -lpthread -lclntsh \
         -o "$out_base" 2>"$BUILD_DIR/link.log"
     if [ ! -x "$out_base" ]; then
         echo -e "${RED}FAIL${NC} (gcc link)"
