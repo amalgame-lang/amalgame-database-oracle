@@ -99,6 +99,10 @@ typedef struct AmalgameOracle {
     OCISvcCtx* svc;          /* service context (post-login); NULL when closed */
     char*      last_error;   /* GC-strdup'd, or NULL */
     i64        last_changes; /* rows affected by the last Exec */
+    int        tx_open;      /* v0.3: set by Begin, cleared by Commit/Rollback.
+                              * When 1, Exec / ExecBind suppress
+                              * OCI_COMMIT_ON_SUCCESS so the user's transaction
+                              * survives multiple statements. */
 } AmalgameOracle;
 
 /* ── Helpers ────────────────────────────────────────── */
@@ -157,6 +161,7 @@ static inline AmalgameOracle* _amor_alloc(void) {
     db->svc          = NULL;
     db->last_error   = NULL;
     db->last_changes = 0;
+    db->tx_open      = 0;
     GC_register_finalizer(db, _amor_finalize, NULL, NULL, NULL);
     return db;
 }
@@ -262,10 +267,16 @@ static inline code_bool Amalgame_Database_Oracle_Exec(
         return 0;
     }
 
-    /* iters=1 for non-SELECT; OCI silently ignores it for DDL. */
+    /* iters=1 for non-SELECT; OCI silently ignores it for DDL.
+     * Skip OCI_COMMIT_ON_SUCCESS while a user-controlled transaction
+     * is open (Begin → Commit/Rollback) so multi-statement
+     * transactions survive across Exec calls. Outside a transaction
+     * we keep the v1 autocommit-on-success behaviour for backwards
+     * compatibility. */
+    ub4 exec_mode = db->tx_open ? OCI_DEFAULT : OCI_COMMIT_ON_SUCCESS;
     rc = OCIStmtExecute(db->svc, stmt, db->err,
                         1, 0, NULL, NULL,
-                        OCI_COMMIT_ON_SUCCESS);
+                        exec_mode);
     if (rc != OCI_SUCCESS && rc != OCI_SUCCESS_WITH_INFO) {
         db->last_error = _amor_err_from_handle(db->err);
         OCIHandleFree(stmt, OCI_HTYPE_STMT);
@@ -411,6 +422,270 @@ static inline AmalgameList* Amalgame_Database_Oracle_QueryAll(
 /* Rows affected by the last Exec, or row count of the last QueryAll. */
 static inline i64 Amalgame_Database_Oracle_Changes(AmalgameOracle* db) {
     return db ? db->last_changes : 0;
+}
+
+/* ────────────────────────────────────────────────────────────────
+ * v0.3 surface — parameter binding + transactions.
+ *
+ * Placeholders are Oracle's `:1`, `:2`, … (NOT `?`). Binding goes
+ * through OCIBindByPos with SQLT_STR; Oracle applies its standard
+ * implicit type conversion at server side (CHAR → NUMBER /
+ * DATE / TIMESTAMP / etc.).
+ *
+ * NULL list entries become SQL NULL via the indicator (-1).
+ *
+ * Arity mismatches surface as "param count mismatch: got X, sql
+ * expects Y" via OCI_ATTR_BIND_COUNT.
+ *
+ * Transactions: Begin sets `tx_open=1`, which causes Exec/ExecBind
+ * to skip OCI_COMMIT_ON_SUCCESS. Commit/Rollback invoke
+ * OCITransCommit / OCITransRollback then clear the flag, returning
+ * autocommit semantics for subsequent standalone statements.
+ * Backwards-compatible: existing code that never calls Begin keeps
+ * v1's autocommit behaviour.
+ * ──────────────────────────────────────────────────────────────── */
+
+/* Shared bind helper: allocates the statement, prepares, validates
+ * arity, binds every param via OCIBindByPos (SQLT_STR). Returns the
+ * statement handle on success (caller frees), NULL on failure (with
+ * db->last_error set). Caller-allocated lens/inds buffers survive
+ * the call so the indicator pointers passed to OCIBindByPos stay
+ * valid through OCIStmtExecute. */
+static inline OCIStmt* _amor_prepare_bound(
+    AmalgameOracle* db, code_string sql, AmalgameList* params,
+    sb2** outInds, ub2** outLens)
+{
+    OCIStmt* stmt = NULL;
+    sword rc = OCIHandleAlloc(db->env, (void**) &stmt,
+                              OCI_HTYPE_STMT, 0, NULL);
+    if (rc != OCI_SUCCESS) {
+        db->last_error = _amor_err_dup("OCIHandleAlloc(STMT) failed");
+        return NULL;
+    }
+    rc = OCIStmtPrepare(stmt, db->err,
+                        (const OraText*) sql, (ub4) strlen(sql),
+                        OCI_NTV_SYNTAX, OCI_DEFAULT);
+    if (rc != OCI_SUCCESS) {
+        db->last_error = _amor_err_from_handle(db->err);
+        OCIHandleFree(stmt, OCI_HTYPE_STMT);
+        return NULL;
+    }
+    int n = params ? (int) AmalgameList_size(params) : 0;
+    ub4 bcount = 0;
+    if (OCIAttrGet(stmt, OCI_HTYPE_STMT, &bcount, NULL,
+                   OCI_ATTR_BIND_COUNT, db->err) != OCI_SUCCESS) {
+        db->last_error = _amor_err_from_handle(db->err);
+        OCIHandleFree(stmt, OCI_HTYPE_STMT);
+        return NULL;
+    }
+    if ((ub4) n != bcount) {
+        char buf[128];
+        snprintf(buf, sizeof(buf),
+            "param count mismatch: got %d, sql expects %u", n, (unsigned) bcount);
+        db->last_error = _amor_err_dup(buf);
+        OCIHandleFree(stmt, OCI_HTYPE_STMT);
+        return NULL;
+    }
+    sb2* inds = (n > 0) ? (sb2*) calloc((size_t)n, sizeof(sb2)) : NULL;
+    ub2* lens = (n > 0) ? (ub2*) calloc((size_t)n, sizeof(ub2)) : NULL;
+    for (int i = 0; i < n; i++) {
+        code_string v = (code_string) AmalgameList_get(params, i);
+        OCIBind* bnd = NULL;
+        if (v) {
+            ub4 vlen = (ub4) strlen(v);
+            inds[i] = 0;
+            lens[i] = (ub2) (vlen + 1);   /* incl. NUL for SQLT_STR */
+            rc = OCIBindByPos(stmt, &bnd, db->err, (ub4)(i + 1),
+                              (void*) v, (sb4) lens[i],
+                              SQLT_STR,
+                              &inds[i], NULL, NULL,
+                              0, NULL, OCI_DEFAULT);
+        } else {
+            inds[i] = -1;
+            lens[i] = 0;
+            rc = OCIBindByPos(stmt, &bnd, db->err, (ub4)(i + 1),
+                              NULL, 0, SQLT_STR,
+                              &inds[i], NULL, NULL,
+                              0, NULL, OCI_DEFAULT);
+        }
+        if (rc != OCI_SUCCESS) {
+            db->last_error = _amor_err_from_handle(db->err);
+            free(inds); free(lens);
+            OCIHandleFree(stmt, OCI_HTYPE_STMT);
+            return NULL;
+        }
+    }
+    *outInds = inds;
+    *outLens = lens;
+    return stmt;
+}
+
+static inline code_bool Amalgame_Database_Oracle_ExecBind(
+        AmalgameOracle* db, code_string sql, AmalgameList* params)
+{
+    if (!db || !db->svc || !db->err) {
+        if (db) db->last_error = _amor_err_dup("connection not open");
+        return 0;
+    }
+    if (!sql) { db->last_error = _amor_err_dup("null sql"); return 0; }
+    sb2* inds = NULL;
+    ub2* lens = NULL;
+    OCIStmt* stmt = _amor_prepare_bound(db, sql, params, &inds, &lens);
+    if (!stmt) return 0;
+    ub4 exec_mode = db->tx_open ? OCI_DEFAULT : OCI_COMMIT_ON_SUCCESS;
+    sword rc = OCIStmtExecute(db->svc, stmt, db->err,
+                              1, 0, NULL, NULL, exec_mode);
+    if (rc != OCI_SUCCESS && rc != OCI_SUCCESS_WITH_INFO) {
+        db->last_error = _amor_err_from_handle(db->err);
+        OCIHandleFree(stmt, OCI_HTYPE_STMT);
+        free(inds); free(lens);
+        return 0;
+    }
+    ub4 nrc = 0;
+    if (OCIAttrGet(stmt, OCI_HTYPE_STMT, &nrc, NULL,
+                   OCI_ATTR_ROW_COUNT, db->err) == OCI_SUCCESS) {
+        db->last_changes = (i64) nrc;
+    } else {
+        db->last_changes = 0;
+    }
+    OCIHandleFree(stmt, OCI_HTYPE_STMT);
+    free(inds); free(lens);
+    db->last_error = _amor_err_dup("");
+    return 1;
+}
+
+static inline AmalgameList* Amalgame_Database_Oracle_QueryBindAll(
+        AmalgameOracle* db, code_string sql, AmalgameList* params)
+{
+    AmalgameList* rows = AmalgameList_new();
+    if (!db || !db->svc || !db->err) {
+        if (db) db->last_error = _amor_err_dup("connection not open");
+        return rows;
+    }
+    if (!sql) { db->last_error = _amor_err_dup("null sql"); return rows; }
+    sb2* inds = NULL;
+    ub2* lens = NULL;
+    OCIStmt* stmt = _amor_prepare_bound(db, sql, params, &inds, &lens);
+    if (!stmt) return rows;
+    /* iters=0 → describe-only execute (same pattern as QueryAll). */
+    sword rc = OCIStmtExecute(db->svc, stmt, db->err,
+                              0, 0, NULL, NULL, OCI_DEFAULT);
+    if (rc != OCI_SUCCESS && rc != OCI_SUCCESS_WITH_INFO) {
+        db->last_error = _amor_err_from_handle(db->err);
+        OCIHandleFree(stmt, OCI_HTYPE_STMT);
+        free(inds); free(lens);
+        return rows;
+    }
+    ub4 ncols = 0;
+    if (OCIAttrGet(stmt, OCI_HTYPE_STMT, &ncols, NULL,
+                   OCI_ATTR_PARAM_COUNT, db->err) != OCI_SUCCESS) {
+        db->last_error = _amor_err_from_handle(db->err);
+        OCIHandleFree(stmt, OCI_HTYPE_STMT);
+        free(inds); free(lens);
+        return rows;
+    }
+    if (ncols == 0) {
+        OCIHandleFree(stmt, OCI_HTYPE_STMT);
+        free(inds); free(lens);
+        db->last_error = _amor_err_dup("");
+        return rows;
+    }
+    char** bufs   = (char**) code_alloc(ncols * sizeof(char*));
+    sb2*   outI   = (sb2*)   code_alloc(ncols * sizeof(sb2));
+    ub2*   outL   = (ub2*)   code_alloc(ncols * sizeof(ub2));
+    for (ub4 j = 0; j < ncols; j++) {
+        bufs[j] = (char*) code_alloc(AMORA_COL_BUFSZ);
+        outI[j] = 0;
+        outL[j] = 0;
+        OCIDefine* def = NULL;
+        sword drc = OCIDefineByPos(stmt, &def, db->err, (ub4)(j + 1),
+                                    bufs[j], (sb4) AMORA_COL_BUFSZ,
+                                    SQLT_STR,
+                                    &outI[j], &outL[j], NULL,
+                                    OCI_DEFAULT);
+        if (drc != OCI_SUCCESS) {
+            db->last_error = _amor_err_from_handle(db->err);
+            OCIHandleFree(stmt, OCI_HTYPE_STMT);
+            free(inds); free(lens);
+            return rows;
+        }
+    }
+    i64 nrows = 0;
+    while (1) {
+        sword frc = OCIStmtFetch2(stmt, db->err, 1,
+                                   OCI_FETCH_NEXT, 0, OCI_DEFAULT);
+        if (frc == OCI_NO_DATA) break;
+        if (frc != OCI_SUCCESS && frc != OCI_SUCCESS_WITH_INFO) {
+            db->last_error = _amor_err_from_handle(db->err);
+            OCIHandleFree(stmt, OCI_HTYPE_STMT);
+            free(inds); free(lens);
+            return rows;
+        }
+        AmalgameList* one = AmalgameList_new();
+        for (ub4 j = 0; j < ncols; j++) {
+            if (outI[j] == -1) {
+                char* dup = (char*) code_alloc(1);
+                dup[0] = '\0';
+                AmalgameList_add(one, (void*) dup);
+            } else {
+                size_t nn = strlen(bufs[j]);
+                char* dup = (char*) code_alloc(nn + 1);
+                if (nn > 0) memcpy(dup, bufs[j], nn);
+                dup[nn] = '\0';
+                AmalgameList_add(one, (void*) dup);
+            }
+        }
+        AmalgameList_add(rows, (void*) one);
+        nrows++;
+    }
+    db->last_changes = nrows;
+    OCIHandleFree(stmt, OCI_HTYPE_STMT);
+    free(inds); free(lens);
+    db->last_error = _amor_err_dup("");
+    return rows;
+}
+
+static inline code_bool Amalgame_Database_Oracle_Begin(AmalgameOracle* db) {
+    if (!db || !db->svc || !db->err) {
+        if (db) db->last_error = _amor_err_dup("connection not open");
+        return 0;
+    }
+    /* Oracle starts an implicit transaction on the first DML
+     * statement; the only state we need to track is whether the
+     * user has opened a multi-statement transaction. */
+    db->tx_open = 1;
+    db->last_error = _amor_err_dup("");
+    return 1;
+}
+
+static inline code_bool Amalgame_Database_Oracle_Commit(AmalgameOracle* db) {
+    if (!db || !db->svc || !db->err) {
+        if (db) db->last_error = _amor_err_dup("connection not open");
+        return 0;
+    }
+    sword rc = OCITransCommit(db->svc, db->err, OCI_DEFAULT);
+    if (rc != OCI_SUCCESS) {
+        db->last_error = _amor_err_from_handle(db->err);
+        return 0;
+    }
+    db->tx_open = 0;
+    db->last_error = _amor_err_dup("");
+    return 1;
+}
+
+static inline code_bool Amalgame_Database_Oracle_Rollback(AmalgameOracle* db) {
+    if (!db || !db->svc || !db->err) {
+        if (db) db->last_error = _amor_err_dup("connection not open");
+        return 0;
+    }
+    sword rc = OCITransRollback(db->svc, db->err, OCI_DEFAULT);
+    if (rc != OCI_SUCCESS) {
+        db->last_error = _amor_err_from_handle(db->err);
+        return 0;
+    }
+    db->tx_open = 0;
+    db->last_error = _amor_err_dup("");
+    return 1;
 }
 
 /* Oracle server release string via OCIServerVersion — e.g.
