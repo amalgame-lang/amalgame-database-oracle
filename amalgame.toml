@@ -70,9 +70,9 @@
 
 [package]
 name              = "amalgame-database-oracle"
-version           = "0.2.0"
+version           = "0.3.0"
 license           = "Apache-2.0"
-description       = "Oracle Database binding for Amalgame — dynamic-linked to Oracle Instant Client (OCI), no vendored lib. QueryAll returns typed List<List<string>>."
+description       = "Oracle Database binding for Amalgame — dynamic-linked to Oracle Instant Client (OCI). v0.3 adds parameter binding (:1 placeholders via OCIBindByPos) and transactions."
 authors           = ["Bastien Mouget"]
 required-amalgame = ">=0.8.40"
 schema-version    = 1
@@ -104,5 +104,13 @@ Exec           = { returns = "code_bool" }
 QueryAll       = { returns = "AmalgameList*", returns_generic = "List<List<string>>" }
 Changes        = { returns = "i64" }
 ServerVersion  = { returns = "code_string" }
+# v0.3: parameter binding via :1/:2/... positional placeholders +
+# transactions. Note: :N is Oracle's convention; SQLite/DuckDB/MySQL/
+# MSSQL use ?, PostgreSQL uses $1.
+ExecBind       = { returns = "code_bool" }
+QueryBindAll   = { returns = "AmalgameList*", returns_generic = "List<List<string>>" }
+Begin          = { returns = "code_bool" }
+Commit         = { returns = "code_bool" }
+Rollback       = { returns = "code_bool" }
 
 [dependencies]

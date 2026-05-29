@@ -229,6 +229,18 @@ run_test "SELECT cell content"     "[PASS] SELECT cell content"
 run_test "IDENTITY id starts at 1" "[PASS] IDENTITY id starts at 1"
 run_test "UPDATE Changes==2"       "[PASS] UPDATE Changes==2"
 run_test "bad SQL reports error"   "[PASS] bad SQL reports error"
+
+# ── v0.3: parameter binding + transactions ──
+run_test "execbind insert"           "[PASS] execbind insert"
+run_test "execbind injection foiled" "[PASS] execbind injection foiled"
+run_test "querybindall fetch"        "[PASS] querybindall fetch"
+run_test "execbind arity check"      "[PASS] execbind arity check"
+run_test "begin"                     "[PASS] begin"
+run_test "rollback"                  "[PASS] rollback"
+run_test "rollback drops insert"     "[PASS] rollback drops insert"
+run_test "commit"                    "[PASS] commit"
+run_test "commit persists insert"    "[PASS] commit persists insert"
+
 run_test "Close drops connection"  "[PASS] Close drops connection"
 
 echo ""

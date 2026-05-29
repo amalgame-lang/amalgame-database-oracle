@@ -107,10 +107,41 @@ Oracle.Close(db)
 | `Oracle.Close(db)` | `void` | Idempotent; GC also closes leaked handles |
 | `Oracle.IsOpen(db)` | `bool` | Live connection check |
 | `Oracle.LastError(db)` | `string` | Empty on success; ORA-xxxxx text |
-| `Oracle.Exec(db, sql)` | `bool` | DDL / INSERT / UPDATE / DELETE; autocommit |
+| `Oracle.Exec(db, sql)` | `bool` | DDL / INSERT / UPDATE / DELETE; autocommit when no transaction is open |
 | `Oracle.QueryAll(db, sql)` | `List<List<string>>` | SELECT, text mode (`SQLT_STR`) |
 | `Oracle.Changes(db)` | `int` | Rows affected by last Exec / row count of last QueryAll |
 | `Oracle.ServerVersion(db)` | `string` | "Oracle Database 23ai Free Release 23.4.0.24.05 …" |
+| `Oracle.ExecBind(db, sql, params)` | `bool` | `:1`/`:2`/… placeholders via `OCIBindByPos` (v0.3+) |
+| `Oracle.QueryBindAll(db, sql, params)` | `List<List<string>>` | Parameterised SELECT (v0.3+) |
+| `Oracle.Begin(db)` | `bool` | Start transaction; suppresses Exec autocommit (v0.3+) |
+| `Oracle.Commit(db)` | `bool` | `OCITransCommit` then restore autocommit (v0.3+) |
+| `Oracle.Rollback(db)` | `bool` | `OCITransRollback` then restore autocommit (v0.3+) |
+
+### Parameter binding (v0.3+)
+
+```amalgame
+let params: List<string> = new List<string>()
+params.Add("Alice")
+params.Add("30")
+Oracle.ExecBind(db, "INSERT INTO users (name, age) VALUES (:1, :2)", params)
+```
+
+Positional `:1`, `:2`, … placeholders — Oracle's native convention.
+SQLite/DuckDB/MySQL/MSSQL use `?`; PostgreSQL uses `$1`. Binding
+goes through `OCIBindByPos` with `SQLT_STR`; Oracle applies its
+implicit type conversion server-side. Arity mismatches surface as
+`"param count mismatch: got X, sql expects Y"` in `LastError` via
+`OCI_ATTR_BIND_COUNT`.
+
+### Transactions (v0.3+)
+
+The v1 `Exec` autocommits every statement via
+`OCI_COMMIT_ON_SUCCESS`. `Begin` sets a flag that switches `Exec` /
+`ExecBind` to `OCI_DEFAULT`, so multi-statement transactions
+survive across calls. `Commit` invokes `OCITransCommit` and
+restores autocommit; `Rollback` invokes `OCITransRollback` and
+restores autocommit. Backwards compatible — code that never calls
+`Begin` keeps v1's autocommit-per-Exec behaviour.
 
 ### Connection string (Easy Connect)
 
